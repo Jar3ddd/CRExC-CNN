@@ -1,0 +1,640 @@
+---
+title: "Shap_Variant_Analysis_2"
+author: "Asa Budnick"
+date: "2026-09-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(cowplot)
+library(patchwork)
+```
+
+
+
+```{r import full pop data and look at distribution of max delta shap}
+full_shap<-readr::read_csv("df_shap_zss_full.csv",col_names = T)
+
+full_shap$var_ID<-paste0(full_shap$Chr,":",full_shap$Pos,"_",full_shap$Ref,"-",full_shap$Alt,"_",full_shap$GeneID)
+head(full_shap$var_ID)
+
+long_shap_expr<-full_shap %>% select(starts_with("expr"),var_ID) %>% select(contains("_label"),var_ID) %>% pivot_longer(cols=starts_with("expr"),names_to = "Tissue",names_prefix = "expr_",values_to = "Expr_Label") %>% filter(!is.na(Expr_Label)) %>%  unique()
+
+```
+
+
+```{r TEST: recalculate deltaSHAP to absSHAP and partition signs}
+full_shap$SHAP_Major_ANTHER==full_shap$SHAP_Ref_ANTHER
+full_shap$SHAP_Major_ANTHER[179]
+full_shap$SHAP_Ref_ANTHER[179]
+
+full_shap$SHAP_Major_LEAF==full_shap$SHAP_Ref_LEAF
+full_shap$SHAP_Major_LEAF[179]
+full_shap$SHAP_Ref_LEAF[179]
+
+#Get rid of a bunch of unnecessary columns to free up space
+full_shap <- full_shap %>% select(var_ID,Chr,Pos,GeneID,Ref,Alt,MAF, starts_with("SHAP_Major"),starts_with("SHAP_Minor")) %>% #zss_alt,starts_with("expr")
+  select(!(starts_with("SHAP_MajorMinor_Delta")))#%>% #select(!c(starts_with("expr_n"),expr_consensus_label))
+
+#pivot longer, discard any NAs and anything that doesn't have a matching tissue
+newSHAP_long<- full_shap %>% pivot_longer(cols =c(starts_with("SHAP_Major")),names_to = "Tissue", values_to = "SHAP_Major",names_prefix = "SHAP_Major_") %>% pivot_longer(cols =c(starts_with("SHAP_Minor")),names_to = "Tissue2", values_to = "SHAP_Minor",names_prefix = "SHAP_Minor_") %>% filter(Tissue==Tissue2) %>% select(!Tissue2) %>% filter(!is.na(SHAP_Major), !is.na(SHAP_Minor))
+
+head(newSHAP_long)
+
+SHAP_max_delta<-newSHAP_long %>% mutate(SHAP_Delta=SHAP_Minor-SHAP_Major,SHAP_Abs_Delta=abs(SHAP_Minor-SHAP_Major),SHAP_Signs=paste0(sign(SHAP_Major),"/",sign(SHAP_Minor))) %>% group_by(var_ID) %>% filter(SHAP_Abs_Delta==max(SHAP_Abs_Delta)) %>% mutate(SHAP_Signs_Cross=ifelse(test = (SHAP_Signs=="-1/1"| SHAP_Signs=="1/-1" ),yes = "crossing",no="non-crossing"))
+
+head(SHAP_max_delta)
+```
+
+
+```{r Trying for a more holistic approach}
+#1 the relationship between MAF and absDSHAP is heteroscedastic and has a negative trend
+
+
+
+prettyhex<-ggplot(SHAP_max_delta) + geom_hex(aes(x=SHAP_Abs_Delta,y=MAF),bins=50)+
+  scale_fill_viridis_c(transform="log",labels = label_number(accuracy = 1,big.mark=""),name = "# Variants")+
+  theme_classic()+
+    xlim(c(-0.003,0.16))+
+  geom_vline(xintercept =quantile(SHAP_max_delta$SHAP_Abs_Delta,0.95)
+,color="red")+
+  labs(x=expression(paste("|",Delta,"SHAP|")))+
+  theme( legend.position = "inside",
+    legend.position.inside = c(1, 1),     
+    legend.justification = c("right", "top")) 
+prettyhex
+
+
+#Let's also look at the 95% percentile point of SHAP_abs_delta
+SHAP_max_delta %>% ungroup() %>% summarise(percentile80th<-quantile(SHAP_Abs_Delta,0.8))
+#Let's compute some variance and mean across quantile bins
+SHAPVAR<-SHAP_max_delta %>% ungroup() %>% mutate(bin=ntile(SHAP_Abs_Delta,n = 500)) %>% group_by(bin) %>% summarise(binleft=min(SHAP_Abs_Delta),SHAP_Abs_Delta=max(SHAP_Abs_Delta),binsd=sd(MAF),binvar=var(MAF),binsize=n())
+SHAPVAR$SHAP_Abs_Delta[1]<-SHAPVAR$binleft[1] #move the first bin to the minimum so we can get the scales for everything right
+stdevPlot<-ggplot(SHAPVAR) +geom_line(aes(x = SHAP_Abs_Delta,y=binsd))+
+  annotate("text",x=0.10,y=0.158, label=expression(
+             paste(sigma^2, " calculated over 500 bins of N=3.9k")))+
+    geom_vline(xintercept =quantile(SHAP_max_delta$SHAP_Abs_Delta,0.95)
+,color="red")+
+  annotate("text", color="red",label="95th Percentile",x=0.04,y=0.158)+
+  labs(y=expression(paste(sigma^2, "  MAF")),x=expression(paste("|",Delta,"SHAP|")))+
+  xlim(c(-0.003,0.16))+
+  theme_classic()
+#stdevPlot
+#prettyhex
+
+#plot_grid(plotlist = c(stdevPlot,prettyhex),ncol = 1,align = "hv",rel_heights = c(0.25,0.75))
+
+patch_fig_1<-prettyhex+stdevPlot+plot_layout(ncol = 1,axes = "collect",heights = c(3,1))
+patch_fig_1
+ggsave(patch_fig_1,filename="hexplot_varline_v01.png",units = "mm",width=170,height = 130)
+``` 
+
+
+```{r can we play around with trying to match expression state to shap values and see if we get better partitioning that way?}
+#import and format the expression data
+
+
+
+long_shap_expr$Tissue<-str_remove(string = long_shap_expr$Tissue,pattern="_label")
+SHAP_max_delta_expr<-merge(x = SHAP_max_delta,y=long_shap_expr,by=c("var_ID","Tissue"),all.x=F,all.y=F)
+
+
+#[C] - expected fitness cost
+#[B] - expected fitness benefit
+#[n] - no expectation for cost or bennefit
+#Could also think about it in terms of stabilizing or destabilizing
+#   SHAP Signs  EXPR: HIGH        LOW
+#   -/-               mmH [C]
+#   -/0               mH
+#   -/+               mpH [B] 
+#   +/-               pmH [C]
+#   +/0               pH
+#   +/+               ppH 
+#   0/0               0           0 
+
+#let's visualize this in terms of a rough table first 
+table(cbind.data.frame(SHAP_max_delta_expr$SHAP_Signs,SHAP_max_delta_expr$Expr_Label))
+ggplot(SHAP_max_delta_expr %>% group_by(SHAP_Signs,Expr_Label) %>% summarize(count=n())) + geom_tile(aes(x=SHAP_Signs,y=Expr_Label,fill=count))+scale_fill_viridis_c(transform="log",labels = label_number(accuracy = 1,big.mark=""))
+
+SHAP_max_delta_expr<-SHAP_max_delta_expr %>% 
+  mutate(SHAP_EXP_DIR=ifelse(sign(SHAP_Delta)>0, 
+                             yes=ifelse(Expr_Label=="high",yes="support",no="oppose"),
+                             no=ifelse(Expr_Label=="high",yes="oppose",no="support"))
+                             
+                             )
+
+#Let's pretty-hex it across the categories
+SHAP_max_delta_expr_hexplot<-ggplot(SHAP_max_delta_expr) + geom_hex(aes(x=SHAP_Delta,y=MAF),bins=50)+
+  scale_fill_viridis_c(transform="log",labels = label_number(accuracy = 1,big.mark=""))+
+  theme_classic()+
+  facet_wrap(~SHAP_EXP_DIR)+
+  annotate(geom = "point",color="red",size=3,)
+  #  xlim(c(-0.003,0.16))+
+ # geom_vline(xintercept =quantile(SHAP_max_delta$SHAP_Abs_Delta,0.95)
+#,color="red")+
+  labs(x=expression(paste(Delta,"SHAP")))+
+  theme( legend.position = "inside",
+    legend.position.inside = c(1, 1),     
+    legend.justification = c("right", "top")) 
+
+SHAP_max_delta_expr_hexplot
+
+#what if we pull the maf numbers for the top 5% (most extreme abs shap) for both of these groups
+
+```
+```{r TESTING: pull percentile bins and compare MAFs across - Partially authored by CLAUDE sonnet 5 medium}
+compare_maf_by_shap_threshold <- function(df, 
+                                            pct_cutoff = 0.80, 
+                                            shap_col = "delta_shap", 
+                                            maf_col = "MAF", 
+                                            group_col = "group") {
+  
+  # --- Input checks ---
+  required_cols <- c(shap_col, maf_col, group_col)
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop("Missing columns in df: ", paste(missing_cols, collapse = ", "))
+  }
+  if (pct_cutoff < 0 || pct_cutoff >= 1) {
+    stop("pct_cutoff must be in [0, 1)")
+  }
+  
+  groups <- unique(df[[group_col]])
+  if (length(groups) != 2) {
+    stop("group_col must have exactly 2 levels, found: ", 
+         paste(groups, collapse = ", "))
+  }
+  
+  # --- Threshold on |delta SHAP| ---
+  abs_shap <- abs(df[[shap_col]])
+  cutoff_value <- quantile(abs_shap, probs = pct_cutoff, na.rm = TRUE)
+  df_filtered <- df[abs_shap >= cutoff_value & !is.na(abs_shap), ]
+  
+  n_total <- nrow(df)
+  n_kept <- nrow(df_filtered)
+  
+  # --- Summary stats per group (on filtered subset) ---
+  summary_stats <- do.call(rbind, lapply(groups, function(g) {
+    maf_vals <- df_filtered[[maf_col]][df_filtered[[group_col]] == g]
+    tibble(
+      group   = g,
+      n       = length(maf_vals),
+      allpts = list(maf_vals),
+      mean    = mean(maf_vals, na.rm = TRUE),
+      median  = median(maf_vals, na.rm = TRUE),
+      sd      = sd(maf_vals, na.rm = TRUE),
+      q25     = quantile(maf_vals, 0.25, na.rm = TRUE),
+      q75     = quantile(maf_vals, 0.75, na.rm = TRUE)
+    )
+  }))
+  rownames(summary_stats) <- NULL
+  
+  # --- Wilcoxon rank-sum test ---
+  maf_g1 <- df_filtered[[maf_col]][df_filtered[[group_col]] == groups[1]]
+  maf_g2 <- df_filtered[[maf_col]][df_filtered[[group_col]] == groups[2]]
+  
+  test_result <- wilcox.test(maf_g1, maf_g2, exact = FALSE, conf.int = TRUE,)
+  
+  # Rank-biserial correlation as effect size #I don't think this is an accurate or meaningful effect size - different effect size implemented later 
+  n1 <- length(maf_g1); n2 <- length(maf_g2)
+  U <- test_result$statistic
+  effect_size <- 1 - (2 * U) / (n1 * n2)
+  
+  # --- Output ---
+  list(
+    pct_cutoff       = pct_cutoff,
+    shap_cutoff_value = as.numeric(cutoff_value),
+    n_total          = n_total,
+    n_kept           = n_kept,
+    frac_kept        = n_kept / n_total,
+    summary_stats    = summary_stats,
+    wilcox_test      = test_result,
+    effect_size_rank_biserial = as.numeric(effect_size)
+  )
+}
+
+#Appears to work 
+compare_maf_by_shap_threshold(df=SHAP_max_delta_expr,group_col = "SHAP_EXP_DIR",shap_col="SHAP_Delta")
+
+percentiles <- seq(.8, 0.99, by = 0.03)
+
+MAF_comp_results <- lapply(percentiles, function(p) {
+  r <- compare_maf_by_shap_threshold(SHAP_max_delta_expr, pct_cutoff = p,,group_col = "SHAP_EXP_DIR",shap_col="SHAP_Delta")
+  tibble(pct_cutoff = p, 
+             n_kept = r$n_kept,
+             mean_MAF_oppose=r$summary_stats$mean[r$summary_stats$group=="oppose"],
+            mean_MAF_support=r$summary_stats$mean[r$summary_stats$group=="support"],
+         allpts_MAF_oppose=r$summary_stats$allpts[r$summary_stats$group=="oppose"],
+                  allpts_MAF_support=r$summary_stats$allpts[r$summary_stats$group=="support"],
+             group_balance=r$summary_stats[1,2]/sum(r$summary_stats[,2]),
+             p_value = r$wilcox_test$p.value, 
+             effect_size = r$effect_size_rank_biserial
+              )
+})
+
+MAF_Comp_df <- do.call(bind_rows, MAF_comp_results)
+
+
+```
+
+```{r let's work on a nice plot of it}
+
+#Split data into shapes for a violin plot and for an annotation layer
+MafComp_Anno_layer<-MAF_Comp_df %>% select(!starts_with("allpts")) %>% pivot_longer(cols = starts_with("mean_MAF"),names_to="SHAP_EXPR_CLASS",names_prefix = "mean_MAF_",values_to = "Mean_MAF")
+
+
+MafComp_violin_layer<-MAF_Comp_df %>% select(pct_cutoff,allpts_MAF_oppose,allpts_MAF_support) %>% pivot_longer(cols = starts_with("allpts"),names_to="SHAP_EXPR_CLASS",names_prefix = "allpts_MAF_",values_to = "allpts_MAF") %>% unnest(allpts_MAF)
+
+library(prettyunits)
+MAF_comp_plot<-ggplot()+
+  geom_boxplot(data=MafComp_violin_layer,aes(x=factor(pct_cutoff),y = allpts_MAF,color=SHAP_EXPR_CLASS))+
+  scale_color_viridis_d(option = "D",begin=0.3, end=0.7, name = expression(paste(Delta,"SHAP Expression Direction")),labels=c("Supporting","Opposing"))+
+  scale_y_continuous(transform = "log2",breaks=c(0,0.0005,0.001,0.01,0.1,0.2,0.5))+
+  labs(y=expression(paste("MAF (Log2)")) , x=expression(paste("Percentile |",Delta,"SHAP| Cutoff")))+
+  theme_classic()+
+  theme(legend.position="top")
+MAF_comp_plot
+
+#This is okay but I think we can do a bit better . . . let's try to add in a shuffled set and then do quantile regressions when we exclude the bottom 80% of deltaSHAPs
+```
+
+```{r repeat and solidify using shuffled data category and labeling testing across categories}
+#First create a subsampled shuffled set of shap and maf
+set.seed(42)
+subsample_delta<-sample(x = SHAP_max_delta$SHAP_Delta,replace = F,size = 281258)
+subsample_maf<-sample(x = SHAP_max_delta$MAF,replace = F,size = 281258)
+SubsampleDF<-data.frame(category="Shuffled",
+                        MAF=subsample_maf,
+                        SHAP_Delta=subsample_delta,
+                        SHAP_Abs_Delta=abs(subsample_delta))
+
+quantile(SubsampleDF$SHAP_Abs_Delta,probs = .8)
+quantile(SHAP_max_delta_expr$SHAP_Abs_Delta,probs = .8)
+
+cutoffs=c(0.80,0.85,0.90,0.95,0.99)
+#cutoffs2=c(0.90,0.92,0.94,0.96,0.98) #made a second option but I don't think the grpah was much improved 
+
+
+ShapExpShufSet_list<-lapply(cutoffs, function(cutoff){
+  ShapExpShufSet_tmp<-SHAP_max_delta_expr %>% select(category=SHAP_EXP_DIR,MAF,SHAP_Delta,SHAP_Abs_Delta) %>% filter(SHAP_Abs_Delta>=quantile(SHAP_max_delta_expr$SHAP_Abs_Delta,probs = cutoff)
+) %>% bind_rows(.,SubsampleDF %>% filter(SHAP_Abs_Delta>=quantile(SubsampleDF$SHAP_Abs_Delta,probs = cutoff)
+)) %>% mutate(cutoff=cutoff)
+}) 
+ShapExpShufSet_full<-bind_rows(ShapExpShufSet_list)
+
+#Deprecated due to removed ShapExpShufSet in far x 
+#ShapExpShufSet_hexplot<-ShapExpShufSet_full %>% filter(cutoff==max(cutoffs)) %>% 
+#  ggplot()+geom_hex(aes(x=SHAP_Delta,y=MAF),bins=50)+
+#  scale_fill_viridis_c(transform="log",labels = label_number(accuracy = 1,big.mark=""))+
+#  theme_classic()+
+#  facet_wrap(~category)+
+#  #  xlim(c(-0.003,0.16))+
+#  geom_vline(xintercept =quantile(SHAP_max_delta$SHAP_Abs_Delta,cutoff),color="red")+
+#  geom_vline(xintercept =-quantile(SHAP_max_delta$SHAP_Abs_Delta,cutoff),color="red")+
+#  labs(x=expression(paste(Delta,"SHAP")))+
+#  theme( legend.position = "bottom") 
+#ShapExpShufSet_hexplot
+
+
+#it's interesting - lets look at the boxplot representation
+ShapExpShufSet_boxplot <-ShapExpShufSet_full %>% ggplot()+geom_boxplot(aes(x=category,y=MAF,fill=factor(cutoff)),alpha=0.6)+
+    scale_y_continuous(transform = "log2",breaks=c(0,0.0005,0.001,0.01,0.1,0.2,0.5))+
+theme_classic()+
+  scale_fill_viridis_d(option = "D",begin=0.7,end=.03)
+ShapExpShufSet_boxplot
+
+#these labels got a bit messed up but not fixing this one since the important one is in the next block 
+```
+
+```{r try for Mann Whitney U Tests across groups and annotated graph - partially authored with Claude Sonnet 5 - medium}
+#install.packages("multcompView")
+library(multcompView)
+#install.packages("effectsize")
+library(effectsize)
+
+# ---------------------------------------------------------------
+# Assumes df has columns: MAF, group (support/oppose/Shuffled), cutoff (0.8...0.99)
+# ---------------------------------------------------------------
+#let's look at it real quick if we remove 0.99 - which mostly just made the chart crowded and the intervals uneven. 
+
+ShapExpShufSet_full2<-ShapExpShufSet_full%>% filter(cutoff!=0.99)
+ShapExpShufSet_full2$group  <- factor(ShapExpShufSet_full2$category,  levels = c("support", "oppose", "Shuffled"))
+ShapExpShufSet_full2$cutoff <- factor(ShapExpShufSet_full2$cutoff, levels = c(0.8, 0.85, 0.9, 0.95))
+                                                                             #,0.99))
+
+# Combine group + cutoff into one factor so every box is its own unit
+ShapExpShufSet_full2$unit <- interaction(ShapExpShufSet_full2$group, ShapExpShufSet_full2$cutoff, sep = "_", drop = TRUE)
+
+# ---------------------------------------------------------------
+# 1. All pairwise Mann-Whitney tests across every box, Bonferroni-corrected
+# ---------------------------------------------------------------
+units <- levels(ShapExpShufSet_full2$unit)
+pair_idx <- combn(units, 2, simplify = FALSE)
+
+pw_results <- lapply(pair_idx, function(pr) {
+  x <- ShapExpShufSet_full2$MAF[ShapExpShufSet_full2$unit == pr[1]]
+  y <- ShapExpShufSet_full2$MAF[ShapExpShufSet_full2$unit == pr[2]]
+  test <- wilcox.test(x, y, exact = FALSE)
+  data.frame(group1 = pr[1], group2 = pr[2], p.raw = test$p.value)
+})
+pw_results <- bind_rows(pw_results)
+pw_results$p.adj <- p.adjust(pw_results$p.raw, method = "bonferroni")
+
+effsize_resutls<-lapply(pair_idx, function(pr) {
+  x <- ShapExpShufSet_full2$MAF[ShapExpShufSet_full2$unit == pr[1]]
+  y <- ShapExpShufSet_full2$MAF[ShapExpShufSet_full2$unit == pr[2]]
+  test <- rank_biserial(x, y, exact = FALSE)
+  data.frame(group1 = pr[1], group2 = pr[2], rbs= test$r_rank_biserial)
+})
+effsize_resutls <- bind_rows(effsize_resutls)
+pAdjAndEFFs_res<-merge(x = pw_results, y=effsize_resutls,by=c("group1",
+                                                              "group2"))
+# ---------------------------------------------------------------
+# 2. Compact letter display (CLD) from the full p-value matrix
+# ---------------------------------------------------------------
+pmat <- matrix(1, nrow = length(units), ncol = length(units),
+                dimnames = list(units, units))
+for (i in seq_len(nrow(pw_results))) {
+  g1 <- pw_results$group1[i]; g2 <- pw_results$group2[i]
+  pmat[g1, g2] <- pw_results$p.adj[i]
+  pmat[g2, g1] <- pw_results$p.adj[i]
+}
+diag(pmat) <- 1
+
+cld <- multcompLetters(pmat, threshold = 0.01)$Letters
+cld_df <- data.frame(unit = names(cld), letter = cld, row.names = NULL)
+
+# split unit back into group/cutoff
+cld_df <- cld_df %>%
+  separate(unit, into = c("group", "cutoff"), sep = "_") %>%
+  mutate(group = factor(group, levels = levels(ShapExpShufSet_full2$group)),
+         cutoff = factor(cutoff, levels = levels(ShapExpShufSet_full2$cutoff)))
+
+# ---------------------------------------------------------------
+# 3. Asterisks: each real group vs. Shuffled at the SAME cutoff
+#    (pulled straight out of pw_results using the adjusted p-values)
+# ---------------------------------------------------------------
+sig_stars <- function(p) {
+  cut(p, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("***", "**", "*", "ns"))
+}
+
+vs_shuffled <- lapply(levels(ShapExpShufSet_full2$cutoff), function(cf) {
+  ref <- paste0("Shuffled_", cf)
+  lapply(c("support", "oppose"), function(g) {
+    unit_g <- paste0(g, "_", cf)
+    row <- pw_results[(pw_results$group1 == unit_g & pw_results$group2 == ref) |
+                       (pw_results$group1 == ref & pw_results$group2 == unit_g), ]
+    data.frame(group = g, cutoff = cf, p.adj = row$p.adj, stars = as.character(sig_stars(row$p.adj)))
+  }) %>% bind_rows()
+}) %>% bind_rows() %>%
+  mutate(group = factor(group, levels = levels(ShapExpShufSet_full2$group)),
+         cutoff = factor(cutoff, levels = levels(ShapExpShufSet_full2$cutoff)))
+
+# ---------------------------------------------------------------
+# 4. Compute y-position and x-position (dodge offset) for annotations
+# ---------------------------------------------------------------
+ymax_df <- ShapExpShufSet_full2 %>%
+  group_by(group, cutoff) %>%
+  summarise(ytop = max(MAF, na.rm = TRUE), median=median(MAF), .groups = "drop")
+
+n_cutoff <- nlevels(ShapExpShufSet_full2$cutoff)
+dodge_width <- 0.75
+offsets <- seq(-(dodge_width - dodge_width/n_cutoff)/2,
+                (dodge_width - dodge_width/n_cutoff)/2,
+                length.out = n_cutoff)
+offset_df <- data.frame(cutoff = levels(ShapExpShufSet_full2$cutoff), x_offset = offsets)
+
+ann_df <- ymax_df %>%
+  left_join(cld_df, by = c("group", "cutoff")) %>%
+  left_join(vs_shuffled %>% select(group, cutoff, stars), by = c("group", "cutoff")) %>%
+  left_join(offset_df, by = "cutoff") %>%
+  mutate(x_pos = as.numeric(group) + x_offset,
+         label = ifelse(is.na(stars) | stars == "ns", letter, paste0(letter, "\n", stars)))
+
+# ---------------------------------------------------------------
+# 5. Plot
+# ---------------------------------------------------------------
+StatBoxPLot_ShapTiter<-ggplot(ShapExpShufSet_full2, aes(x = group, y = MAF, fill = cutoff)) +
+  geom_boxplot(position = position_dodge(width = dodge_width), outlier.shape = NA,alpha=0.7) +
+  geom_text(data = ann_df,
+            aes(x = x_pos, y = ytop * 1.4, label = label),
+            inherit.aes = FALSE, size = 3, lineheight = 0.8) +
+  #geom_point(data = ann_df, aes(x = x_pos,y=median))+
+  scale_y_continuous(transform = "log2",breaks=c(0,0.0005,0.001,0.005,0.01,0.05,0.1,0.5),labels=label_number(decimal.mark = "."))+
+theme_classic()+
+scale_x_discrete(labels = c("Supporting","Opposing","Shuffled"))+
+  scale_fill_viridis_d(option = "D",begin=0.7,end=.03,name = expression(paste("Percentile ","|",Delta,"SHAP|")))+
+  theme(axis.title.x=element_blank(),legend.position="bottom")
+
+StatBoxPLot_ShapTiter
+ggsave(StatBoxPLot_ShapTiter,filename="Boxplot_MannU_v01.png",units = "mm",width=170,height = 130)
+
+
+
+```
+
+```{r TODO: Export}
+#export nice images and supplementary data tables (adj pval and Rank Bi-serial correlations)
+
+ggsave(patch_fig_1,filename=paste0("Fig6_v1_",Sys.Date(),".pdf"),device = cairo_pdf,units = "mm",width=170,height = 130,dpi = 600)
+
+ggsave(StatBoxPLot_ShapTiter,filename=paste0("Fig7_v1_",Sys.Date(),".pdf"),units = "mm",width=170,height = 130,dpi = 600,device = cairo_pdf)
+
+#Export the pvals +bsr values for fig 7
+# - pAdjAndEFFs_res
+
+#Export the top 95th percentile opposing maf shap in case anybody wants to use it as a resource ... 
+Top_95_Oppose<-SHAP_max_delta_expr %>% filter(SHAP_Abs_Delta>=quantile(SHAP_max_delta_expr$SHAP_Abs_Delta,probs = .95)) %>% filter(SHAP_EXP_DIR=="oppose") %>% unique()
+
+#install.packages("openxlsx")
+library(openxlsx)
+ex_sheetlist<-list("Fig7_MannWhitneyTestValues"=pAdjAndEFFs_res,
+                   "Top_95th_SHAP_Opposing_Variants"=Top_95_Oppose)
+write.xlsx(ex_sheetlist,file = paste0("Supp_Table_XX_v1_",Sys.Date(),".xlsx"))
+
+```
+
+```{r TEST: look in on TRP1}
+playdata<-SHAP_max_delta_expr %>% filter(GeneID=="Os09g0493500")
+
+playdata_exp<-newSHAP_long %>% filter(GeneID=="Os09g0493500")
+
+
+```
+
+```{r Scratchwork - look at some genes}
+#among the opposing and max abs delta shaps what are the qualities of the genes? 
+colnames(SHAP_max_delta_expr)
+#Chr4:19858963_G-A_Os04g0401300	PANICLE	Chr4	19858963	Os04g0401300	G	A	0.005623940	0.103576720	-2.930192e-02	-0.13287864	0.13287864	1/-1	crossing	
+#Chr12:7994709_G-T_Os12g0244200	ANTHER	Chr12	7994709	Os12g0244200	G	T	0.001465940	0.087010798	-4.399605e-02	-0.13100685	0.13100685	1/-1	crossing	
+#Chr1:37320454_G-T_Os01g0862300	SEED	Chr1	37320454	Os01g0862300	G	T	0.000279772	0.065329154	-6.037031e-02	-0.12569946	0.12569946	1/-1	crossing	
+#Chr10:8796409_G-A_Os10g0321700	PANICLE	Chr10	8796409	Os10g0321700	G	A	0.001934950	0.079817201	-4.046727e-02	-0.12028447	0.12028447	1/-1	crossing	
+#Chr1:3450109_G-C_Os01g0167500	PISTIL	Chr1	3450109	Os01g0167500	G	C	0.001221570	0.075882335	-4.111872e-02	-0.11700106	0.11700106	1/-1	crossing	
+#Chr12:21500832_G-C_Os12g0538900	ANTHER	Chr12	21500832	Os12g0538900	G	C	0.003544780	0.099178030	-1.699702e-02	-0.11617505	0.11617505	1/-1	crossing
+#Chr12:17955822_C-A_Os12g0485400	ANTHER	Chr12	17955822	Os12g0485400	C	A	0.007257490	0.100277607	-9.335273e-03	-0.10961288	0.10961288	1/-1	crossing	
+#Chr8:25864795_G-T_Os08g0520300	ANTHER	Chr8	25864795	Os08g0520300	G	T	0.002786030	0.084145317	-2.440918e-02	-0.10855450	0.10855450	1/-1	crossing	
+#Chr8:25937167_C-G_Os08g0521400	PANICLE	Chr8	25937167	Os08g0521400	C	G	0.006888950	0.083626440	-2.468843e-02	-0.10831487	0.10831487	1/-1	crossing	
+#Chr5:3484962_T-C_Os05g0159000	PISTIL	Chr5	3484962	Os05g0159000	T	C	0.000185185	0.072182980	-3.586949e-02	-0.10805247	0.10805247	1/-1	crossing	
+#Chr9:22644779_C-G_Os09g0567300	SEED	Chr9	22644779	Os09g0567300	C	G	0.001003830	0.090720052	-1.649988e-02	-0.10721993	0.10721993	1/-1	crossing	
+#Chr1:21879107_C-G_Os01g0570500	PANICLE	Chr1	21879107	Os01g0570500	C	G	0.001397300	0.083402545	-2.024902e-02	-0.10365157	0.10365157	1/-1	crossing	
+#Chr4:23186013_C-G_Os04g0464500	ROOT	Chr4	23186013	Os04g0464500	C	G	0.000440917	0.060944420	-3.824911e-02	-0.09919353	0.09919353	1/-1	crossing	
+#Chr9:20375111_G-A_Os09g0521500	PISTIL	Chr9	20375111	Os09g0521500	G	A	0.003900160	0.071158465	-2.791227e-02	-0.09907074	0.09907074	1/-1	crossing	
+#Chr1:37071812_G-A_Os01g0857700	ANTHER	Chr1	37071812	Os01g0857700	G	A	0.002416580	0.053976574	-4.494368e-02	-0.09892026	0.09892026	1/-1	crossing	
+#Chr1:34655400_G-A_Os01g0814900	ANTHER	Chr1	34655400	Os01g0814900	G	A	0.001477920	0.059141575	-3.798675e-02	-0.09712832	0.09712832	1/-1	crossing	
+#Chr8:8806813_T-A_Os08g0244100	INFLORESCENCE	Chr8	8806813	Os08g0244100	T	A	0.001752120	0.067409032	-2.931708e-02	-0.09672611	0.09672611	1/-1	crossing	
+```
+
+#DEPRECATED 
+
+```{r plot out the major and minor across SHAP signs}
+split_hexplots<-ggplot(SHAP_max_delta,aes(x=SHAP_Abs_Delta,y=MAF)) +
+  geom_hex(bins=10)+
+  scale_fill_viridis_c()+
+  facet_wrap(~SHAP_Signs)
+split_hexplots
+
+split_hexplots2<-ggplot(SHAP_max_delta,aes(x=SHAP_Abs_Delta,y=MAF)) +
+  geom_hex(bins=10)+
+  scale_fill_viridis_c()+
+  facet_wrap(~SHAP_Signs_Cross)
+split_hexplots2
+
+split_hexplots_dshap<-ggplot(SHAP_max_delta,aes(x=SHAP_Delta,y=MAF)) +
+  geom_hex(bins=10)+
+  scale_fill_viridis_c()+
+  facet_wrap(~SHAP_Signs)
+split_hexplots_dshap
+
+split_hexplots_dshap2<-ggplot(SHAP_max_delta,aes(x=SHAP_Delta,y=MAF)) +
+  geom_hex(bins=10)+
+  scale_fill_viridis_c()+
+  facet_wrap(~SHAP_Signs_Cross)
+split_hexplots_dshap2
+```
+
+
+```{r try to do some regressions across these}
+
+mod0<-lm(MAF ~ SHAP_Abs_Delta,data=SHAP_max_delta)
+summary(mod0)
+plot(mod0)
+
+Mod_1<-lm(MAF ~ SHAP_Abs_Delta+SHAP_Signs,data = SHAP_max_delta)
+Mod_1
+summary(Mod_1)
+
+Mod_int<-lm(MAF ~ SHAP_Abs_Delta*SHAP_Signs,data = SHAP_max_delta)
+summary(Mod_int)
+plot(Mod_int)
+```
+
+
+```{r make some distribution depictions of shap for skewness / kurtosis}
+
+#distributions<-newSHAP_long %>% ggplot(aes(x=SHAP_Major,fill = Tissue))+geom_density(alpha=0.2)+theme_minimal()+scale_fill_viridis_d()
+#distributions
+
+#distributions2<-newSHAP_long %>% ggplot(aes(x=SHAP_Minor,fill = Tissue))+geom_density(alpha=0.2)+theme_minimal()+scale_fill_viridis_d()
+#distributions2
+
+#They are less informative than the bargraph
+```
+
+```{r okay let's just take a peak at binning the max abs delta shaps across crossing and non-crossing }
+SHAP_max_delta_binned_cross<-SHAP_max_delta %>% group_by(SHAP_Signs_Cross) %>%  mutate(bin = ntile(SHAP_Abs_Delta, n=200)) %>% group_by(SHAP_Signs_Cross,bin) %>% summarise(mean_MAF=mean(MAF),mean_adSHAP=mean(SHAP_Abs_Delta),mean_dSHAP=mean(SHAP_Delta))
+
+
+
+SHAP_max_Abs_delta_binned_cross_plot<-ggplot(SHAP_max_delta_binned_cross)+geom_point(mapping = (aes(x=mean_adSHAP,y=mean_MAF)))+facet_wrap(~SHAP_Signs_Cross)
+SHAP_max_Abs_delta_binned_cross_plot
+
+SHAP_max_delta_binned_cross_plot<-ggplot(SHAP_max_delta_binned_cross)+geom_point(mapping = (aes(x=mean_dSHAP,y=mean_MAF)))+facet_wrap(~SHAP_Signs_Cross)
+SHAP_max_delta_binned_cross_plot
+#stderr_maf=stderr(MAF),stderr_adSHAP=stderr(SHAP_Abs_Delta)
+  
+SHAP_max_delta_binned_sets<-SHAP_max_delta %>% group_by(SHAP_Signs) %>%  mutate(bin = ntile(SHAP_Abs_Delta, n=200)) %>% group_by(SHAP_Signs,bin) %>% summarise(mean_MAF=mean(MAF),mean_adSHAP=mean(SHAP_Abs_Delta),mean_dSHAP=mean(SHAP_Delta))
+
+SHAP_max_Abs_delta_binned_sets_plot<-ggplot(SHAP_max_delta_binned_sets)+geom_point(mapping = (aes(x=mean_adSHAP,y=mean_MAF)))+facet_wrap(~SHAP_Signs)
+SHAP_max_Abs_delta_binned_sets_plot
+
+SHAP_max_delta_binned_sets_plot<-ggplot(SHAP_max_delta_binned_sets)+geom_point(mapping = (aes(x=mean_dSHAP,y=mean_MAF)))+facet_wrap(~SHAP_Signs)
+SHAP_max_delta_binned_sets_plot
+
+```
+
+```{r run linear models and refine graph}
+SHAP_max_delta_binned_cross_plot<-ggplot(SHAP_max_delta_binned_cross)+geom_point(mapping = (aes(x=mean_dSHAP,y=mean_MAF)))+facet_wrap(~SHAP_Signs_Cross)
+SHAP_max_delta_binned_cross_plot
+
+
+Lm_Cross<-lm(mean_MAF ~mean_dSHAP, data=SHAP_max_delta_binned_cross %>% filter(SHAP_Signs_Cross=="crossing"))
+Lm_noCross<-lm(mean_MAF ~mean_dSHAP, data=SHAP_max_delta_binned_cross %>% filter(SHAP_Signs_Cross=="non-crossing"))
+
+summary(Lm_Cross)
+summary(Lm_noCross)
+
+
+library(ggpubr)
+nice_scatter<-ggscatter(data = SHAP_max_delta_binned_cross, x="mean_dSHAP",y="mean_MAF",  add = "reg.line",add.params = list(color = "red"),alpha=0.3)+
+  ylim(0,0.5)+
+  facet_wrap(~SHAP_Signs_Cross)+
+  stat_cor(label.y=0.5)+
+   stat_regline_equation(
+    aes(label = paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")))
+nice_scatter
+```
+```{r how bad does it get if we stop binning?}
+nice_scatter_noBin<-ggscatter(data = SHAP_max_delta, x="SHAP_Delta",y="MAF",  add = "reg.line",add.params = list(color = "red"),alpha=0.05)+
+  ylim(0,0.6)+
+  facet_wrap(~SHAP_Signs_Cross)+
+  stat_cor(label.y=0.6)+
+   stat_regline_equation(
+    aes(label = paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")))
+nice_scatter_noBin
+```
+```{r let's figure out how susceptible our conclusion is to different binning values}
+#For 6 different bin numbers from 10 to 10000 (+ no binning) lets see what kind of variation we get in our results
+
+bin_counts=c(10,50,100,200,1000,10000)
+binplots<-vector('list',length(bin_counts))
+for(i in 1:length(bin_counts)){
+  bin=bin_counts[i]
+  tmp_SHAP_max_delta_binned_cross<-SHAP_max_delta %>% group_by(SHAP_Signs_Cross) %>%  mutate(bin = ntile(SHAP_Abs_Delta, n=bin)) %>% group_by(SHAP_Signs_Cross,bin) %>% summarise(mean_MAF=mean(MAF),mean_adSHAP=mean(SHAP_Abs_Delta),mean_dSHAP=mean(SHAP_Delta))
+                                                                                                                                                                                        
+  binplots[[i]]<-ggscatter(data = tmp_SHAP_max_delta_binned_cross, x="mean_dSHAP",y="mean_MAF",  add = "reg.line",add.params = list(color = "red"),alpha=0.3)+
+  ylim(0,0.6)+
+  facet_wrap(~SHAP_Signs_Cross)+
+  stat_cor(label.y=0.6)+
+   stat_regline_equation(
+    aes(label = paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")))+
+    ggtitle(bin)
+  
+}
+binplots
+```
+```{r bin test to match manuscript draft}
+
+bin_counts=c(10,50,100,200,500,1000,10000,50000)
+binplots2<-vector('list',length(bin_counts))
+for(i in 1:length(bin_counts)){
+  bin=bin_counts[i]
+  tmp_SHAP_max_delta_binned_manu<-SHAP_max_delta %>% mutate(Major_Pos=sign(SHAP_Major)>0) %>% group_by(Major_Pos) %>%  mutate(bin = ntile(SHAP_Abs_Delta, n=bin)) %>% group_by(Major_Pos,bin) %>% summarise(mean_MAF=mean(MAF),mean_adSHAP=mean(SHAP_Abs_Delta),mean_dSHAP=mean(SHAP_Delta))
+                                                                                                                                                                                        
+  binplots2[[i]]<-ggscatter(data = tmp_SHAP_max_delta_binned_manu, x="mean_dSHAP",y="mean_MAF",  add = "reg.line",add.params = list(color = "red"),alpha=0.3)+
+  ylim(0,0.6)+
+  facet_wrap(~Major_Pos)+
+  stat_cor(label.y=0.6)+
+   stat_regline_equation(
+    aes(label = paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")))+
+    ggtitle(bin)
+  
+}
+binplots2
+
+```
