@@ -1,0 +1,1031 @@
+---
+title: "Final Script for Publication"
+author: "Jared Richarson"
+date: "2026-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Disclaimer
+
+Here are finalized scripts that will be referenced for future use and creating publication figures. Set working directory to the following: /project/dbnrrc/jared/Rproject/final_paper_scripts
+
+## Dataframe creation
+
+Below are the steps to create the full and TRJ population dataframes. 
+
+```{r}
+## Thi is for the original .rds file - Potentially needed for merging full population ZSS. Comment/uncomment as needed.
+#df_shap_zss <- readRDS("./data/df_shap_zss.rds")
+```
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(readr)
+
+# Step 0 — Load & merge per-tissue SHAP CSVs
+
+# Setting variables and file reading
+SHAP_DIR      <- "./data/vcf_shap_byTissue_byChr"
+TISSUES       <- c("ANTHER", "ENDOSPERM", "INFLORESCENCE", "LEAF",
+                   "PANICLE", "PISTIL", "ROOT", "SEED")
+CHROMOSOMES   <- paste0("Chr", 1:12)
+FILE_TEMPLATE <- "{chr}_SHAP_fullVCF_Annotated_06-01-26.csv"                     # Edit this depending on what population you would like to merge: FULL - {chr}_SHAP_fullVCF_Annotated_06-01-26.csv TRJ - {chr}_SHAP_TRJVCF_Annotated_06-01-26.csv
+JOIN_KEYS     <- c("Chr", "Pos", "GeneID", "Ref", "Alt")
+META_COLS     <- c("AF", "MAF", "plantCAD_zero_shot", "ANN_effect")
+
+
+# STep 1: Load all per-chromosome CSVs per tissue
+load_tissue <- function(tissue) {
+  t_upper    <- toupper(tissue)
+  col_tissue <- paste0(toupper(substr(tissue, 1, 1)),
+                       tolower(substr(tissue, 2, nchar(tissue))))
+
+  files <- file.path(SHAP_DIR, tissue, "fullVCF",
+                     sapply(CHROMOSOMES, function(chr)
+                       gsub("\\{chr\\}", chr, FILE_TEMPLATE)))
+
+  df <- map(files, function(f) {
+    if (!file.exists(f)) { message("  Missing: ", f); return(NULL) }
+    read.csv(f, stringsAsFactors = FALSE)
+  }) %>% bind_rows()
+
+  if (nrow(df) == 0) { warning("No data for: ", tissue); return(NULL) }
+
+  df %>%
+    rename(
+      !!paste0("SHAP_Ref_",   t_upper) := paste0("SHAP_Ref_",   col_tissue),
+      !!paste0("SHAP_Alt_",   t_upper) := paste0("SHAP_Alt_",   col_tissue),
+      !!paste0("SHAP_Major_", t_upper) := paste0("SHAP_Major_", col_tissue),
+      !!paste0("SHAP_Minor_", t_upper) := paste0("SHAP_Minor_", col_tissue)
+    ) %>%
+    select(all_of(c(JOIN_KEYS, META_COLS,
+                    paste0("SHAP_Ref_",   t_upper),
+                    paste0("SHAP_Alt_",   t_upper),
+                    paste0("SHAP_Major_", t_upper),
+                    paste0("SHAP_Minor_", t_upper)))) %>%
+    { message("  Loaded ", nrow(.), " rows for ", tissue); . }
+}
+
+message("Loading tissue CSVs...")
+tissue_dfs <- map(TISSUES, load_tissue) %>%
+  set_names(TISSUES) %>%
+  compact()  # removes NULLs (replaces Filter(Negate(is.null), ...))
+
+
+# Step 2: Full join all tissues, preserving metadata via coalesce
+message("Merging tissues...")
+
+df_merged <- tissue_dfs[[1]]
+
+for (tissue in names(tissue_dfs)[-1]) {
+  t_upper   <- toupper(tissue)
+  shap_cols <- paste0(c("SHAP_Ref_", "SHAP_Alt_", "SHAP_Major_", "SHAP_Minor_"), t_upper)
+
+  df_merged <- full_join(
+    df_merged,
+    tissue_dfs[[tissue]] %>% select(all_of(c(JOIN_KEYS, META_COLS, shap_cols))),
+    by = JOIN_KEYS,
+    suffix = c("", ".fill")
+  ) %>%
+  mutate(across(all_of(META_COLS), ~ coalesce(.x, get(paste0(cur_column(), ".fill"))))) %>%
+  select(-ends_with(".fill"))
+}
+
+message("Merged: ", nrow(df_merged), " rows, ", ncol(df_merged), " columns")
+
+
+# Step 3: Per-tissue deltas
+message("Computing per-tissue deltas...")
+
+t_uppers <- toupper(names(tissue_dfs))
+
+for (t in t_uppers) {
+  df_merged <- df_merged %>%
+    mutate(
+      !!paste0("SHAP_RefAlt_Delta_",         t) :=
+        .data[[paste0("SHAP_Alt_",   t)]] - .data[[paste0("SHAP_Ref_", t)]],
+      !!paste0("SHAP_RefAlt_Delta_abs_",     t) :=
+        abs(.data[[paste0("SHAP_RefAlt_Delta_", t)]]),
+      !!paste0("SHAP_MajorMinor_Delta_",     t) :=
+        .data[[paste0("SHAP_Minor_", t)]] - .data[[paste0("SHAP_Major_", t)]],
+      !!paste0("SHAP_MajorMinor_Delta_abs_", t) :=
+        abs(.data[[paste0("SHAP_MajorMinor_Delta_", t)]])
+    )
+}
+
+
+# Step 4: Cross-tissue summaries
+message("Computing cross-tissue summaries...")
+
+delta_cols <- paste0("SHAP_MajorMinor_Delta_",     t_uppers)
+major_cols <- paste0("SHAP_Major_",                t_uppers)
+minor_cols <- paste0("SHAP_Minor_",                t_uppers)
+
+df_merged <- df_merged %>%
+  mutate(
+    max_SHAP_Delta  = apply(pick(all_of(delta_cols)), 1, max,  na.rm = TRUE),
+    min_SHAP_Delta  = apply(pick(all_of(delta_cols)), 1, min,  na.rm = TRUE),
+    mean_SHAP_Major = apply(pick(all_of(major_cols)), 1, mean, na.rm = TRUE),
+    max_SHAP_Minor  = apply(pick(all_of(minor_cols)), 1, max,  na.rm = TRUE),
+    min_SHAP_Minor  = apply(pick(all_of(minor_cols)), 1, min,  na.rm = TRUE),
+    # Replace Inf/-Inf (from all-NA rows in max()/min()) with NA
+    # FIX 1: mean() on an all-NA row returns NaN, not Inf -- is.infinite(NaN) is
+    # FALSE, so mean_SHAP_Major was silently keeping NaN instead of NA. Added
+    # is.nan() alongside is.infinite() to catch both cases.
+    across(c(max_SHAP_Delta, min_SHAP_Delta,
+             mean_SHAP_Major, max_SHAP_Minor, min_SHAP_Minor),
+           ~ if_else(is.infinite(.x) | is.nan(.x), NA_real_, .x))
+  )
+
+
+# Step 5: Largest-effect tissue columns (vectorised)
+message("Computing largest-effect tissue columns...")
+
+abs_delta_cols <- paste0("SHAP_MajorMinor_Delta_abs_", t_uppers)
+
+abs_delta_mat <- as.matrix(df_merged[abs_delta_cols])
+delta_mat     <- as.matrix(df_merged[delta_cols])
+minor_mat     <- as.matrix(df_merged[minor_cols])
+
+# FIX 2: max.col() returns NA for the WHOLE row if it contains any NA at all,
+# not just when the row is entirely NA (confirmed empirically). Since most
+# variants won't have SHAP data in all 8 tissues, this was nulling out the
+# largest-effect columns for the majority of rows, not just the truly
+# no-data ones. Filling NA with -Inf makes max.col() ignore missing tissues
+# and only pick from the ones that actually have data.
+abs_delta_mat_filled <- abs_delta_mat
+abs_delta_mat_filled[is.na(abs_delta_mat_filled)] <- -Inf
+
+best_idx <- max.col(abs_delta_mat_filled, ties.method = "first")  # vectorised — no loop needed
+all_na   <- rowSums(!is.na(abs_delta_mat)) == 0
+
+df_merged$SHAP_largestEff_Delta <- ifelse(all_na, NA_real_,
+  delta_mat[cbind(seq_len(nrow(delta_mat)), best_idx)])
+df_merged$SHAP_largestEff_Minor <- ifelse(all_na, NA_real_,
+  minor_mat[cbind(seq_len(nrow(minor_mat)), best_idx)])
+
+
+# Step 6: Derive zss columns
+# NOTE: Both currently set to plantCAD_zero_shot as placeholder.
+# Update if zss_alt and zss_minor should differ.
+df_merged <- df_merged %>%
+  mutate(zss_alt   = plantCAD_zero_shot,
+         zss_minor = plantCAD_zero_shot)
+
+
+# Step 7: Rename and reorder
+message("Finalising column order...")
+
+df_shap_zss_full <- df_merged %>%
+  rename(variant_type = ANN_effect) %>%
+  select(
+    all_of(JOIN_KEYS), AF, MAF, variant_type, zss_alt, zss_minor,
+    all_of(paste0("SHAP_Ref_",               t_uppers)),
+    all_of(paste0("SHAP_Alt_",               t_uppers)),
+    all_of(paste0("SHAP_Major_",             t_uppers)),
+    all_of(paste0("SHAP_Minor_",             t_uppers)),
+    all_of(paste0("SHAP_RefAlt_Delta_",      t_uppers)),
+    all_of(paste0("SHAP_RefAlt_Delta_abs_",  t_uppers)),
+    all_of(paste0("SHAP_MajorMinor_Delta_",         t_uppers)),
+    all_of(paste0("SHAP_MajorMinor_Delta_abs_",     t_uppers)),
+    max_SHAP_Delta, min_SHAP_Delta, mean_SHAP_Major,
+    max_SHAP_Minor, min_SHAP_Minor,
+    SHAP_largestEff_Delta, SHAP_largestEff_Minor
+  )
+
+message("Part 1 done. ", nrow(df_shap_zss_full), " rows, ",
+        ncol(df_shap_zss_full), " columns")
+
+## For the full population VCF, the original ZSS were saved to separate files. Using the initial .rds file generated, we append the MAF and ZSS scores appropriately. The commented section below is strictly utilized only for the full population SHAP dataframe.
+## Uncomment and comment as needed depending on what population dataframe you would like to generate.
+df_shap_zss_dedup <- df_shap_zss %>%
+  distinct(Chr, Pos, Ref, Alt, zss_alt, zss_minor) %>%
+  group_by(Chr, Pos, Ref, Alt) %>%
+  slice(1) %>%   # safety net — confirmed identical but just in case
+  ungroup()
+
+stopifnot(nrow(df_shap_zss_dedup %>% count(Chr, Pos, Ref, Alt) %>% filter(n > 1)) == 0)
+
+df_shap_zss_full <- df_shap_zss_full %>%
+  left_join(
+    df_shap_zss_dedup,
+    by = c("Chr", "Pos", "Ref", "Alt"),
+    suffix = c("", ".new"),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    zss_alt   = coalesce(zss_alt.new,   zss_alt),
+    zss_minor = coalesce(zss_minor.new, zss_minor)
+  ) %>%
+  select(-zss_alt.new, -zss_minor.new)
+
+
+# Step 8 — Per-tissue SHAP classification (+/+, +/-, -/+, -/-)
+message("Classifying per-tissue SHAP major/minor patterns...")
+
+classify_shap <- function(major, delta) {
+  # Vectorised if-else over major (SHAP score sign) and delta (minor - major)
+  case_when(
+    major > 0 & delta > 0 ~ "+/+",            # Positive SHAP score / Minor allele increases prediction
+    major > 0 & delta < 0 ~ "+/-",            # Positive SHAP score / Minor allele decreases prediction
+    major < 0 & delta > 0 ~ "-/+",            # Negative SHAP score / Minor allele increases prediction
+    major < 0 & delta < 0 ~ "-/-"             # Negative SHAP score / Minor allele decreases prediction
+  )
+}
+
+# FIX 3: this loop now writes to df_shap_zss_trj (the final curated object
+# from Step 0), not df_merged -- df_merged never makes it into the output,
+# so mutating it here was a no-op as far as the final data was concerned.
+for (t in TISSUES) {
+  major_col <- paste0("SHAP_Major_", t)
+  delta_col <- paste0("SHAP_MajorMinor_Delta_", t)
+  class_col <- paste0("SHAP_class_", t)
+
+  df_shap_zss_full <- df_shap_zss_full %>%
+    mutate(
+      !!class_col := classify_shap(.data[[major_col]], .data[[delta_col]])
+    )
+}
+
+if (all(c("SHAP_largestEff_Minor", "SHAP_largestEff_Delta") %in% colnames(df_shap_zss_full))) {
+  df_shap_zss_full <- df_shap_zss_full %>%
+    mutate(
+      SHAP_largestEff_Major = SHAP_largestEff_Minor - SHAP_largestEff_Delta,   # Minor - Major = Delta
+      SHAP_class_largestEff = classify_shap(SHAP_largestEff_Major, SHAP_largestEff_Delta)
+    )
+}
+
+message("Part 2 done. ", ncol(df_shap_zss_full), " columns")
+
+
+# Step 9 — Merge per-tissue expression class labels + consensus
+# Directory containing the deepcre interpret meta CSVs
+meta_dir <- "/project/dbnrrc/jared/research/DeepCRE-CUDA/model_reimplemented/deepCRE_reimplemented/src/deepCRE/results/shap/"
+
+# Explicit mapping: meta CSV filename -> SHAP column tissue suffix
+# RHS must match the tissue suffix used in the SHAP columns above (e.g. SHAP_Minor_LEAF)
+tissue_map <- c(
+  "oryzaAnther_deepcre_interpret_250925_213856_shap_meta.csv"        = "ANTHER",
+  "oryzaEndosperm_deepcre_interpret_250925_211231_shap_meta.csv"     = "ENDOSPERM",
+  "oryzaInflorescence_deepcre_interpret_250825_110841_shap_meta.csv" = "INFLORESCENCE",
+  "oryzaLeaf_deepcre_interpret_250312_012429_shap_meta.csv"          = "LEAF",
+  "oryzaPanicle_deepcre_interpret_250825_113406_shap_meta.csv"       = "PANICLE",
+  "oryzaPistil_deepcre_interpret_250925_203644_shap_meta.csv"        = "PISTIL",
+  "oryzaRoot_deepcre_interpret_250312_011535_shap_meta.csv"          = "ROOT",
+  "oryzaSeed_deepcre_interpret_250925_201000_shap_meta.csv"          = "SEED"
+)
+
+message("Reading expression meta files ...")
+
+expr_list <- lapply(seq_along(tissue_map), function(i) {
+  fname  <- names(tissue_map)[i]
+  tissue <- tissue_map[[i]]
+  fpath  <- file.path(meta_dir, fname)
+
+  if (!file.exists(fpath)) {
+    warning(sprintf("  [MISSING] %s — skipping '%s'", fpath, tissue))
+    return(NULL)
+  }
+
+  read_csv(fpath,
+           col_types = cols(gene_ids = col_character(),
+                            preds    = col_integer()),
+           trim_ws = TRUE) %>%
+    rename(GeneID = gene_ids) %>%
+    mutate(
+      !!paste0("expr_", tissue)           := preds,
+      !!paste0("expr_", tissue, "_label") :=
+        factor(if_else(preds == 0L, "low", "high"), levels = c("low", "high"))
+    ) %>%
+    select(GeneID,
+           all_of(paste0("expr_", tissue)),
+           all_of(paste0("expr_", tissue, "_label"))) %>%
+    { message(sprintf("  Loaded %-15s  %s genes", tissue, nrow(.))); . }
+})
+
+expr_list  <- Filter(Negate(is.null), expr_list)
+expr_table <- reduce(expr_list, full_join, by = "GeneID")
+
+message(sprintf("Expression table: %s unique genes across %s tissues",
+                nrow(expr_table), length(expr_list)))
+
+message("Merging expression labels onto df_shap_zss_trj ...")
+df_shap_zss_full <- left_join(df_shap_zss_full, expr_table, by = "GeneID")
+
+# Coverage check
+first_expr_col <- names(df_shap_zss_full)[
+  startsWith(names(df_shap_zss_full), "expr_") &
+  !endsWith(names(df_shap_zss_full), "_label")
+][1]
+n_matched <- sum(!is.na(df_shap_zss_full[[first_expr_col]]))
+message(sprintf("  Variants with expression label: %s / %s (%.1f%%)",
+                n_matched, nrow(df_shap_zss_full),
+                100 * n_matched / nrow(df_shap_zss_full)))
+
+# Consensus column (renamed to expr_consensus_label to match the target structure)
+expr_raw_cols <- paste0("expr_", unname(tissue_map))[
+  paste0("expr_", unname(tissue_map)) %in% names(df_shap_zss_full)
+]
+
+df_shap_zss_full <- df_shap_zss_full %>%
+  mutate(
+    expr_n_high  = rowSums(across(all_of(expr_raw_cols), ~ .x == 1L), na.rm = TRUE),
+    expr_n_low   = rowSums(across(all_of(expr_raw_cols), ~ .x == 0L), na.rm = TRUE),
+    expr_n_total = rowSums(!is.na(across(all_of(expr_raw_cols)))),
+    # FIX 4: genes with zero tissue coverage (n_total == 0) satisfied
+    # n_high == n_total (0 == 0) and fell into the "high" branch instead of
+    # the "mixed" fallback. Explicit n_total == 0 guard added first so
+    # no-data genes get NA instead of a fabricated "high" label.
+    expr_consensus_label = factor(
+      case_when(
+        expr_n_total == 0L            ~ NA_character_,
+        expr_n_high  == expr_n_total  ~ "high",
+        expr_n_low   == expr_n_total  ~ "low",
+        TRUE                          ~ "mixed"
+      ),
+      levels = c("low", "mixed", "high")
+    )
+  )
+
+message("Consensus expression class distribution:")
+print(count(df_shap_zss_full, expr_consensus_label))
+
+
+message("Done. Final: ", nrow(df_shap_zss_full), " rows, ",
+        ncol(df_shap_zss_full), " columns")
+
+# Final write
+# saveRDS(df_shap_zss_trj, "df_shap_zss_trj.Rds")
+#
+#write.csv(df_shap_zss_full, file = "df_shap_zss_full_08-21-26.csv")
+
+```
+
+
+# Loading finalized dataframes
+
+```{r}
+df_shap_zss_trj <- read.csv("./df_shap_zss_trj_08-21-26.csv")
+df_shap_zss_full <- read.csv("./df_shap_zss_full_08-21-26.csv")
+```
+
+## Noncoding variants
+```{r}
+# Noncoding variants
+noncoding_df_shap_zss_full <- subset(df_shap_zss_full, variant_type %in% c("downstream_gene_variant", "upstream_gene_variant", "5_prime_UTR_variant", "5_prime_UTR_premature_start_codon_gain_variant", "3_prime_UTR_variant"))
+
+noncoding_df_shap_zss_trj <- subset(df_shap_zss_trj, variant_type %in% c("downstream_gene_variant", "upstream_gene_variant", "5_prime_UTR_variant", "5_prime_UTR_premature_start_codon_gain_variant", "3_prime_UTR_variant", "intron_variant", "splice_region_variant&non_coding_transcript_exon_variant"))
+```
+
+## Stratified datasets
+```{r}
+# Label stratification
+df_shap_zss_full_highExp <- subset(noncoding_df_shap_zss_full, expr_consensus_label == "high")
+df_shap_zss_full_lowExp <- subset(noncoding_df_shap_zss_full, expr_consensus_label == "low")
+df_shap_zss_full_mixedExp <- subset(noncoding_df_shap_zss_full, expr_consensus_label == "mixed")
+
+df_shap_zss_trj_highExp <- subset(noncoding_df_shap_zss_trj, expr_consensus_label == "high")
+df_shap_zss_trj_lowExp <- subset(noncoding_df_shap_zss_trj, expr_consensus_label == "low")
+df_shap_zss_trj_mixedExp <- subset(noncoding_df_shap_zss_trj, expr_consensus_label == "mixed")
+```
+
+# Plots for paper
+
+## Accurracy barplot -- Figure 2
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Defining file paths
+BASE <- "/project/dbnrrc/jared/research/DeepCRE-CUDA/model_reimplemented/deepCRE_reimplemented/src/deepCRE/results/predictions"
+
+files <- list(
+  Leaf          = file.path(BASE, "oryzaLeaf_SSR_deepcre_predict_250312_004626.csv"),
+  Root          = file.path(BASE, "oryzaRoot_SSR_deepcre_predict_250312_004126.csv"),
+  Anther        = file.path(BASE, "oryzaAnther_SSR_deepcre_predict_250925_183450.csv"),
+  Pistil        = file.path(BASE, "oryzaPistil_SSR_deepcre_predict_250925_194240.csv"),
+  Inflorescence = file.path(BASE, "oryzaInflorescence_SSR_deepcre_predict_250825_104206.csv"),
+  Panicle       = file.path(BASE, "oryzaPanicle_Panicle_predictions_08-31-26.csv"),
+  Endosperm     = file.path(BASE, "oryzaEndosperm_SSR_deepcre_predict_250925_194305.csv"),
+  Seed          = file.path(BASE, "oryzaSeed_SSR_deepcre_predict_250925_194214.csv")
+)
+
+# Compute accuracy
+compute_accuracy <- function(path) {
+  df <- read.csv(path)
+  df <- df[df$true_targets != 2, ]
+  df$pred_label <- as.integer(df$pred_probs >= 0.5)
+  mean(df$pred_label == df$true_targets)
+}
+
+acc_vals <- sapply(files, compute_accuracy)
+
+# Data frame
+tissue_order <- c("Leaf", "Root", "Anther", "Pistil",
+                  "Inflorescence", "Panicle", "Endosperm", "Seed")
+
+tissue_colors <- c(
+  Leaf = "#4CAF50", Root = "#8B5E3C", Anther = "#FF8C00",
+  Pistil = "#FFD700", Inflorescence = "#BA55D3", Panicle = "#C2185B",
+  Endosperm = "#64B5F6", Seed = "#A1887F"
+)
+
+plot_df <- data.frame(
+  tissue   = factor(tissue_order, levels = tissue_order),
+  accuracy = acc_vals[tissue_order]
+)
+
+# Bracket positions
+bracket_y <- -0.06   # horizontal bracket bar
+tick_y    <- -0.08   # bottom of bracket ticks
+label_y   <- -0.12   # group label
+
+brackets <- data.frame(
+  xmin  = c(0.65, 2.65, 6.65),
+  xmax  = c(2.35, 6.35, 8.35),
+  label = c("Vegetative", "Reproductive", "Seed-related"),
+  lx    = c(1.5, 4.5, 7.5),
+  color = c("#2E7D32", "#6A1B9A", "#4E342E")
+)
+
+# Plot
+p <- ggplot(plot_df, aes(x = tissue, y = accuracy, fill = tissue)) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.3f", accuracy)),
+            vjust = -0.4, size = 3.6, colour = "#333333") +
+  geom_vline(xintercept = c(2.5, 6.5),
+             linetype = "dashed", colour = "#BBBBBB", linewidth = 0.8) +
+  scale_fill_manual(values = tissue_colors) +
+  scale_y_continuous(
+    limits = c(-0.16, 1.02),
+    breaks = seq(0, 1, 0.2),
+    labels = function(x) ifelse(x < 0, "", sprintf("%.1f", x)),
+    expand = expansion(mult = c(0, 0.02)),
+    oob    = scales::squish
+  ) +
+  labs(x = "Tissues", y = "Accuracy") +
+  theme_classic(base_size = 13) +
+  theme(
+    #axis.title.x    = element_text(margin = margin(t = 55)),
+    axis.title.y    = element_text(margin = margin(r = 8)),
+    axis.text.x     = element_text(size = 11, colour = "black", margin = margin(t = 6)),
+    axis.text.y     = element_text(size = 11),
+    legend.position = "none",
+    #plot.margin     = margin(t = 10, r = 15, b = 65, l = 15)
+    axis.title.x    = element_text(margin = margin(t = 8)),
+    plot.margin     = margin(t = 10, r = 15, b = 30, l = 15)
+  ) +
+  coord_cartesian(clip = "off")
+
+# Brackets
+for (i in seq_len(nrow(brackets))) {
+  b <- brackets[i, ]
+  p <- p +
+    annotate("segment", x = b$xmin, xend = b$xmax,
+             y = bracket_y, yend = bracket_y,
+             colour = b$color, linewidth = 0.9) +
+    annotate("segment", x = b$xmin, xend = b$xmin,
+             y = bracket_y, yend = tick_y,
+             colour = b$color, linewidth = 0.9) +
+    annotate("segment", x = b$xmax, xend = b$xmax,
+             y = bracket_y, yend = tick_y,
+             colour = b$color, linewidth = 0.9) +
+    annotate("text", x = b$lx, y = label_y,
+             label = b$label, colour = b$color,
+             fontface = "bold", size = 3.8)
+}
+print(p)
+
+
+ggsave(p, filename = paste0("Fig2_TissueAccuracy_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+
+
+get_stats <- function(path) {
+  df <- read.csv(path)
+  df <- df[df$true_targets != 2, ]
+  pred <- as.integer(df$pred_probs >= 0.5)
+  true <- df$true_targets
+
+  tp <- sum(pred == 1 & true == 1)
+  tn <- sum(pred == 0 & true == 0)
+  fp <- sum(pred == 1 & true == 0)
+  fn <- sum(pred == 0 & true == 1)
+
+  data.frame(
+    n            = nrow(df),
+    n_pos        = sum(true == 1),
+    n_neg        = sum(true == 0),
+    accuracy     = mean(pred == true),
+    balanced_acc = mean(c(tp / (tp + fn), tn / (tn + fp)))
+  )
+}
+
+tissue_stats <- bind_rows(lapply(names(files), function(t) {
+  cbind(tissue = t, get_stats(files[[t]]))
+}))
+tissue_stats <- tissue_stats[match(tissue_order, tissue_stats$tissue), ]
+
+library(openxlsx)
+ex_sheetlist_tissueacc <- list("Fig2_TissueAccuracy_Stats" = tissue_stats)
+write.xlsx(ex_sheetlist_tissueacc, file = paste0("Supp_Table_fig2_XX_v1_", Sys.Date(), ".xlsx"))
+```
+
+## Cross species testing and plotting -- Figure 3
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(viridis)
+
+PRED_DIR   <- "/project/dbnrrc/jared/research/DeepCRE-CUDA/model_reimplemented/deepCRE_reimplemented/src/deepCRE/results/predictions"
+BASE_DIR   <- file.path(PRED_DIR, "cross_predictions")
+OUTPUT_DIR <- "cross_species_results"
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
+
+get_stats <- function(path) {
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  df <- df[df$true_targets %in% c(0, 1), ]
+  pred <- as.integer(df$pred_probs >= 0.5)
+  true <- df$true_targets
+
+  tp <- sum(pred == 1 & true == 1)
+  tn <- sum(pred == 0 & true == 0)
+  fp <- sum(pred == 1 & true == 0)
+  fn <- sum(pred == 0 & true == 1)
+
+  data.frame(
+    n            = nrow(df),
+    n_pos        = sum(true == 1),   # high expression
+    n_neg        = sum(true == 0),   # low expression
+    accuracy     = mean(pred == true),
+    balanced_acc = mean(c(tp / (tp + fn), tn / (tn + fp)))
+  )
+}
+
+# Cross-species files (Rice -> Other, Other -> Rice)
+all_files <- list.files(BASE_DIR, pattern = "\\.csv$",
+                        recursive = TRUE, full.names = TRUE)
+
+if (length(all_files) == 0) {
+  stop("No CSV files found under BASE_DIR = '", BASE_DIR, "'.")
+}
+
+parse_meta <- function(path) {
+  fname  <- basename(path)
+  folder <- basename(dirname(path))
+  tissue <- ifelse(grepl("Leaf", fname, ignore.case = TRUE), "Leaf", "Root")
+
+  if (folder == "ory_on_model_species") {
+    direction     <- "Rice → Other"
+    species_label <- case_when(
+      grepl("sorghum", fname) ~ "Sorghum bicolor",
+      grepl("zea",     fname) ~ "Zea mays",
+      grepl("solanum", fname) ~ "Solanum lycopersicum",
+      grepl("ara",     fname) ~ "Arabidopsis thaliana"
+    )
+  } else {
+    direction     <- "Other → Rice"
+    species_label <- case_when(
+      grepl("^sbic|^sor", fname) ~ "Sorghum bicolor",
+      grepl("^zea",       fname) ~ "Zea mays",
+      grepl("^sol",       fname) ~ "Solanum lycopersicum",
+      grepl("^ara",       fname) ~ "Arabidopsis thaliana"
+    )
+  }
+  data.frame(path, direction, species_label, tissue, stringsAsFactors = FALSE)
+}
+
+cross_meta <- bind_rows(lapply(all_files, parse_meta))
+cross_meta <- cbind(cross_meta, bind_rows(lapply(cross_meta$path, get_stats)))
+
+# Self-prediction files — each species' model tested on its own held-out data
+self_files <- data.frame(
+  path = file.path(PRED_DIR, c(
+    "sbicLeaf_SSR_deepcre_predict_250520_164312.csv",
+    "sbicRoot_SSR_deepcre_predict_250520_212851.csv",
+    "zeaLeaf_SSR_deepcre_predict_250521_030656.csv",
+    "zeaRoot_SSR_deepcre_predict_250521_011920.csv",
+    "solLeaf_SSR_deepcre_predict_250520_132504.csv",
+    "solRoot_SSR_deepcre_predict_250520_235418.csv",
+    "araLeaf_SSR_deepcre_predict_250520_130059.csv",
+    "araRoot_SSR_deepcre_predict_250520_201639.csv"
+  )),
+  species_label = rep(c("Sorghum bicolor", "Zea mays",
+                         "Solanum lycopersicum", "Arabidopsis thaliana"), each = 2),
+  tissue    = rep(c("Leaf", "Root"), times = 4),
+  direction = "Self",
+  stringsAsFactors = FALSE
+)
+self_files <- cbind(self_files, bind_rows(lapply(self_files$path, get_stats)))
+
+# Rice self-prediction (250312 run) — the ceiling; drawn as a reference line
+# since rice isn't one of the x-axis species categories
+rice_self <- data.frame(
+  path   = file.path(PRED_DIR, c("oryzaLeaf_SSR_deepcre_predict_250312_004626.csv",
+                                  "oryzaRoot_SSR_deepcre_predict_250312_004126.csv")),
+  tissue = factor(c("Leaf", "Root"), levels = c("Leaf", "Root")),
+  stringsAsFactors = FALSE
+)
+rice_self <- cbind(rice_self, bind_rows(lapply(rice_self$path, get_stats)))
+
+# quick check
+message("Self-prediction accuracies:")
+print(self_files %>% dplyr::select(species_label, tissue, n, n_pos, n_neg, accuracy, balanced_acc))
+message("Rice self-prediction accuracies (ceiling):")
+print(rice_self %>% dplyr::select(tissue, n, n_pos, n_neg, accuracy, balanced_acc))
+
+# Combine and set factor levels/order
+meta <- bind_rows(
+  cross_meta %>% dplyr::select(direction, species_label, tissue, n, n_pos, n_neg, accuracy, balanced_acc),
+  self_files %>% dplyr::select(direction, species_label, tissue, n, n_pos, n_neg, accuracy, balanced_acc)
+) %>%
+  mutate(
+    species_label = factor(species_label, levels = c(
+      "Sorghum bicolor", "Zea mays",
+      "Solanum lycopersicum", "Arabidopsis thaliana")),
+    tissue    = factor(tissue,    levels = c("Leaf", "Root")),
+    direction = factor(direction, levels = c("Self", "Rice → Other", "Other → Rice"))
+  )
+
+# Plot
+p <- ggplot(meta, aes(x = species_label, y = accuracy, fill = species_label)) +
+  geom_col(width = 0.65, colour = "white") +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             colour = "grey40", linewidth = 0.6) +
+  geom_hline(data = rice_self, aes(yintercept = accuracy),
+             linetype = "dotted", colour = "black", linewidth = 0.7) +
+  geom_label(aes(label = paste0(round(accuracy * 100, 1), "%")),
+             nudge_y = 0.035, vjust = 0, size = 3.2, fontface = "bold",
+             fill = "white", linewidth = 0,
+             label.padding = unit(0.12, "lines")) +
+  facet_grid(tissue ~ direction) +
+  scale_fill_viridis_d(option = "D", guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                      expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0.40, 1.08)) +
+  labs(x = NULL, y = "Accuracy") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x        = element_text(angle = 35, hjust = 1, face = "italic"),
+    strip.background   = element_rect(fill = "#f0f0f0"),
+    strip.text         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    plot.subtitle      = element_text(size = 9, colour = "grey40")
+  )
+print(p)
+
+ggsave(p, filename = paste0("./submission_figures_data/Fig3_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+
+write.csv(meta, file = "./submission_figures_data/Figure3_meta.csv")
+```
+
+
+# Plant Caduceus
+
+Plant Caduceus is a  DNA language model that has demonstrated great capabilities in many tasks. Particularly, the quantification of deleteriousness through the computation of zero-shot scores (ZSS) and the binary classification of gene expression. We utilize the model as a orthogonal comparison to our model predictions and to serve as insurance that our analysis aligns with other methodologies.
+
+
+# PlantCAD2 Binary Gene Expression
+
+## Plots for acc. (CNN + PC2) -- Figure 4
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# generalized comparison function - takes an already-loaded predictions data
+# frame (instead of a file path) since predictions are already read in below.
+# pc_input/cnn_df/preds_df passed explicitly so leaf and root don't collide
+run_comparison_tissue <- function(pc_input, cnn_df, preds_df, label) {
+  pc_input$gene <- sub("t", "g", sub("-.*", "", pc_input$id))
+  pc_input$pc_pred <- as.integer(preds_df$probability_positive >= 0.5)
+
+  matched <- inner_join(pc_input, cnn_df, by = c("gene" = "genes")) %>%
+    filter(true_targets != 2) %>%
+    transmute(
+      gene, true_label = true_targets,
+      pc_pred, cnn_pred = as.integer(pred_probs > 0.5),
+      pc_correct = pc_pred == true_label,
+      cnn_correct = cnn_pred == true_label,
+      true_class = ifelse(true_label == 1, "High", "Low")
+    )
+
+  # quick check - catches a bad join/column mismatch immediately instead of
+  # silently producing garbage accuracy numbers
+  cat(label, "- matched rows:", nrow(matched),
+      "| PC acc:", round(mean(matched$pc_correct), 3),
+      "| CNN acc:", round(mean(matched$cnn_correct), 3), "\n")
+
+  matched
+}
+
+# load inputs
+# .tsv files use read.delim - they're tab-separated, and read.csv on a
+# tab-separated file usually loads everything into one garbled column
+pc_root_input <- read.delim("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_root_plantcad_input.tsv", stringsAsFactors = FALSE)
+pc_leaf_input <- read.delim("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_leaf_plantcad_input.tsv", stringsAsFactors = FALSE)
+
+pc_leaf_preds_bl <- read.csv("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_leaf_baseline_predictions.csv")
+pc_leaf_preds_ft <- read.csv("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_leaf_finetuned_predictions.csv")
+
+pc_root_preds_bl <- read.csv("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_root_baseline_predictions.csv")
+pc_root_preds_ft <- read.csv("/project/dbnrrc/jared/research/plantcad/abs_geneExpression_example/upd_preds/RGAPTPM_root_finetuned_predictions.csv")
+
+cnn_leaf_preds <- read.csv("/project/dbnrrc/jared/research/DeepCRE-CUDA/model_reimplemented/deepCRE_reimplemented/src/deepCRE/results/predictions/oryzaLeaf_Leaf_predictions_08-31-26_transformed.csv")
+cnn_root_preds <- read.csv("/project/dbnrrc/jared/research/DeepCRE-CUDA/model_reimplemented/deepCRE_reimplemented/src/deepCRE/results/predictions/oryzaRoot_Root_predictions_08-31-26_transformed.csv")
+
+# comparisons, both tissues
+matched_leaf_baseline  <- run_comparison_tissue(pc_leaf_input, cnn_leaf_preds, pc_leaf_preds_bl, "PC2 Direct Transfer vs CNN (leaf)")
+matched_leaf_finetuned <- run_comparison_tissue(pc_leaf_input, cnn_leaf_preds, pc_leaf_preds_ft, "PC2 Fine-tuned vs CNN (leaf)")
+matched_root_baseline  <- run_comparison_tissue(pc_root_input, cnn_root_preds, pc_root_preds_bl, "PC2 Direct Transfer vs CNN (root)")
+matched_root_finetuned <- run_comparison_tissue(pc_root_input, cnn_root_preds, pc_root_preds_ft, "PC2 Fine-tuned vs CNN (root)")
+
+library(viridis)
+
+# build one tidy table: tissue x model, where model now encodes
+# PlantCAD2's version directly (CNN has no baseline/finetuned distinction,
+# so it only needs one row per tissue instead of being duplicated)
+acc_row <- function(matched_bl, matched_ft, tissue) {
+  tibble::tibble(
+    tissue   = tissue,
+    model    = c("CNN", "PlantCAD2 (Baseline)", "PlantCAD2 (Finetuned)"),
+    accuracy = c(mean(matched_bl$cnn_correct),
+                 mean(matched_bl$pc_correct),
+                 mean(matched_ft$pc_correct))
+  )
+}
+
+acc_df <- bind_rows(
+  acc_row(matched_leaf_baseline, matched_leaf_finetuned, "Leaf"),
+  acc_row(matched_root_baseline, matched_root_finetuned, "Root")
+) %>%
+  mutate(model = factor(model, levels = c("CNN", "PlantCAD2 (Baseline)", "PlantCAD2 (Finetuned)")))
+
+fig <- ggplot(acc_df, aes(x = tissue, y = accuracy, fill = model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(accuracy, 3)),
+            position = position_dodge(width = 0.8), vjust = -0.5, size = 3.5) +
+  scale_fill_viridis_d(option = "D") +
+  ylim(0, 1) +
+  theme_classic(base_size = 13) +
+  labs(x = NULL, y = "Prediction Accuracy", fill = NULL)
+
+print(fig)
+
+ggsave(fig, filename = paste0("./submission_figures_data/Fig4_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+```
+
+## Skewness -- Figure 5
+
+On the newly merged SHAP files lets look at skewness of the Delta-SHAP and the major and minor alleles.
+
+```{r}
+## Kurtosis and Skewness
+library(dplyr)
+library(moments)
+
+TISSUES <- c("ANTHER", "ENDOSPERM", "INFLORESCENCE", "LEAF",
+             "PANICLE", "PISTIL", "ROOT", "SEED")
+
+col_sets <- list(
+  #Delta = paste0("SHAP_MajorMinor_Delta_", TISSUES),
+  Major = paste0("SHAP_Major_",            TISSUES),
+  Minor = paste0("SHAP_Minor_",            TISSUES)
+)
+
+skew_kurt_stat_table <- bind_rows(lapply(c("FULL"), function(pop) {
+  df <- if (pop == "FULL") df_shap_zss_full else df_shap_zss_trj
+  bind_rows(lapply(names(col_sets), function(metric_name) {
+    cols <- col_sets[[metric_name]]
+    tibble(
+      population = pop,
+      metric     = metric_name,
+      tissue     = TISSUES,
+      n          = sapply(cols, function(col) sum(!is.na(df[[col]]))),
+      mean = sapply(cols, function(col) mean(df[[col]], na.rm = TRUE)),     
+      median     = sapply(cols, function(col) median(df[[col]], na.rm = TRUE)),
+      variance   = sapply(cols, function(col) var(df[[col]], na.rm = TRUE)),
+      skewness   = sapply(cols, function(col) skewness(df[[col]], na.rm = TRUE)),
+      kurtosis   = sapply(cols, function(col) kurtosis(df[[col]], na.rm = TRUE))
+    )
+  }))
+}))
+
+print(skew_kurt_stat_table, n = 48)
+
+library(tidyr)
+library(ggplot2)
+library(viridis)
+
+# Plotting code (this is the part that generalizes to real table)
+plot_df <- skew_kurt_stat_table %>%
+  dplyr::select(population, metric, tissue, skewness, kurtosis) %>%
+  pivot_longer(cols = c(skewness, kurtosis), names_to = "statistic", values_to = "value") %>%
+  mutate(
+    statistic = factor(statistic, levels = c("skewness", "kurtosis"),
+                        labels = c("Skewness", "Excess kurtosis")),
+    population = factor(population, levels = c("FULL", "TRJ"),
+                         labels = c("Full population", "TRJ subpopulation")),
+    tissue = factor(tissue, levels = TISSUES <- c("ANTHER", "ENDOSPERM", "INFLORESCENCE",
+                                                   "LEAF", "PANICLE", "PISTIL", "ROOT", "SEED"))
+  )
+
+# reference lines: 0 = symmetric distribution; 0 excess kurtosis = normal-tailed distribution
+ref_lines <- tibble(
+  statistic = factor(c("Skewness", "Excess kurtosis"), levels = c("Skewness", "Excess kurtosis")),
+  yint = c(0, 0)
+)
+
+fig <- ggplot(plot_df, aes(x = tissue, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  # geom_hline(data = ref_lines, aes(yintercept = yint), linetype = "dashed",
+  #            color = "grey40", linewidth = 0.4) +
+  facet_grid(statistic ~ ., scales = "free_y") +
+  scale_fill_viridis_d(option = "D", name = "Allele") +
+  labs(
+    x = NULL,
+    y = NULL,
+    #title = "Shape of Delta-SHAP attribution distributions across tissues"
+    #subtitle = "Dashed line: 0 = symmetric (top) or normal-tailed (bottom)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top"
+  )
+print(fig)
+
+# Save figure
+ggsave(fig, filename = paste0("./submission_figures_data/Fig5_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+
+# Export supplementary stats table
+library(openxlsx)
+ex_sheetlist <- list("Fig8_SkewKurtStats" = skew_kurt_stat_table)
+write.xlsx(ex_sheetlist, file = paste0("./submission_figures_data/Supp_Table_XX_v1_", Sys.Date(), ".xlsx"))
+```
+All three metrics are heavily zero-concentrated with extreme kurtosis, meaning most variants have negligible regulatory effects but a small number have very large ones. Delta-SHAP is consistently left-skewed across all tissues and both populations, indicating that when minor alleles do have an effect, they more often suppress expression than activate it — and this directional bias is stronger in the full population than in TRJ.
+
+
+## Rare Allele Enrichment -- Figure 8
+
+To check for rare allele enrichment in the SHAP classes, we look at the CDF of MAF for a given SHAP value.
+
+```{r}
+library(viridis)
+library(patchwork)
+
+delta_col <- "SHAP_largestEff_Delta"
+
+# Full
+df0 <- df_shap_zss_full %>%
+  filter(SHAP_largestEff_Major > 0) %>%
+  filter(!is.na(MAF), !is.na(.data[[delta_col]]), !is.na(SHAP_class_largestEff)) %>%
+  mutate(group = pair_group(SHAP_class_largestEff)) %>%
+  filter(!is.na(group)) %>%
+  transmute(group, x = .data[[delta_col]], maf = MAF)
+
+# Orig. abs(x) -> two x for respective tail
+df_ecdf0 <- df0 %>%
+  mutate(effect_group = ifelse(x <= quantile(x, .01), "Top 1% |ΔSHAP|", "Background"))
+
+p_ecdf <- ggplot(df_ecdf0, aes(x = maf, color = effect_group)) +
+  stat_ecdf(linewidth = 1.1) +
+  theme_classic(base_size = 13) +
+  scale_colour_viridis_d(option = "D") +
+  labs(x = "MAF", y = "ECDF", color = NULL)#,
+       #title = "ECDF of MAF (Full): Top 1% |ΔSHAP| vs Background")
+
+p_box <- ggplot(df_ecdf0, aes(x = effect_group, y = maf, fill = effect_group)) +
+  geom_boxplot(width = 0.5, outlier.size = 1) +
+  theme_classic(base_size = 13) +
+  scale_fill_viridis_d(option = "D") +
+  labs(x = NULL, y = "MAF", fill = NULL) +
+  theme(legend.position = "none") 
+
+p_ecdf / p_box
+
+fig_mafshift <- p_ecdf / p_box
+
+ggsave(fig_mafshift, filename = paste0("./submission_figures_data/Fig8_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+
+# Wilcoxon rank-sum (Mann-Whitney) test: MAF, Top 1% |ΔSHAP| vs Background
+wtest_mafshift <- wilcox.test(maf ~ effect_group, data = df_ecdf0)
+
+# Effect size (rank-biserial correlation, range -1 to 1)
+n1 <- sum(df_ecdf0$effect_group == "Top 1% |ΔSHAP|")
+n2 <- sum(df_ecdf0$effect_group == "Background")
+#r_rb <- 1 - (2 * unname(wtest_mafshift$statistic)) / (n1 * n2)
+r_rb <- 1 - (2 * unname(wtest_mafshift$statistic)) / (as.numeric(n1) * n2)
+
+MafShift_MannWhitney_res <- tibble(
+  comparison      = "Top 1% |ΔSHAP| vs Background",
+  n_top           = n1,
+  n_bg            = n2,
+  W_stat          = unname(wtest_mafshift$statistic),
+  p_value         = wtest_mafshift$p.value,
+  rank_biserial_r = r_rb
+)
+
+print(MafShift_MannWhitney_res)
+```
+
+
+# Zero-shot Scores -- Figure 9
+
+For each of the populations we've combined Plant Caduceus' ZSS for the variants within our population. Before one-to-one comparisons we first verify that the results from the zero-shot scores are consistent with published results. To do so, we first investigate the relationship between MAF and binned ZSS.
+
+```{r}
+library(viridis)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+real_colors <- viridis(2, option = "D")
+
+# Final bin order for both metrics, most deleterious first
+FINAL_LEVELS <- c("Top 0.1%", "Top 1%", "Top 10%", "Top 50%", "Bottom 50%")
+# narrow quantile slices at the LOW end - both metrics are signed, and after
+# the SHAP_largestEff_Major > 0 filter, most negative = most deleterious for
+# both (matches the bottom-tail convention used in the earlier ECDF code)
+BREAKS_ASC <- c(0, 0.001, 0.01, 0.1, 0.5, 1)
+
+# quick check before filtering - SHAP_largestEff_Major is often mostly NA,
+# make sure this filter isn't dropping nearly everything
+cat("non-NA SHAP_largestEff_Major:", sum(!is.na(noncoding_df_shap_zss_full$SHAP_largestEff_Major)),
+    "of", nrow(noncoding_df_shap_zss_full), "\n")
+
+df <- noncoding_df_shap_zss_full %>%
+  filter(SHAP_largestEff_Major > 0) %>%
+  filter(!is.na(MAF),
+    !is.na(SHAP_largestEff_Delta),
+    !is.na(zss_minor))
+
+bin_by_metric <- function(df, metric_col, metric_label) {
+  qs <- quantile(df[[metric_col]], probs = BREAKS_ASC, na.rm = TRUE)
+  df %>%
+    mutate(bin = cut(.data[[metric_col]], breaks = as.numeric(qs),
+                      labels = FINAL_LEVELS, include.lowest = TRUE)) %>%
+    group_by(bin) %>%
+    summarise(mean_maf = mean(MAF, na.rm = TRUE),
+              sd_maf = sd(MAF, na.rm = TRUE),
+              n = n(), .groups = "drop") %>%
+    mutate(se_maf = sd_maf / sqrt(n),
+           metric = metric_label)
+}
+
+# null baseline - shuffle ΔSHAP so it's randomly paired with MAF, breaking
+# any real relationship, then bin the same way. This shows what the line
+# looks like with no signal at all, for comparison against the real trend.
+set.seed(1)
+df <- df %>% mutate(SHAP_shuffled = sample(abs(SHAP_largestEff_Delta)))
+
+plot_df <- bind_rows(
+  bin_by_metric(df, "zss_minor", "ZSS"),
+  bin_by_metric(df, "SHAP_largestEff_Delta", "ΔSHAP"),
+  bin_by_metric(df, "SHAP_shuffled", "ΔSHAP (shuffled)")
+)
+
+# Plot - baseline gets a dashed grey line so it reads as "null", not a
+# third real result. Error bars show ±1 SE of MAF within each bin.
+fig <- ggplot(plot_df, aes(x = bin, y = mean_maf, color = metric, group = metric,
+                            linetype = metric == "ΔSHAP (shuffled)")) +
+  geom_line(position = position_dodge(width = 0.3), linewidth = 1) +
+  geom_point(position = position_dodge(width = 0.3), size = 2) +
+  geom_errorbar(aes(ymin = mean_maf - se_maf, ymax = mean_maf + se_maf),
+                position = position_dodge(width = 0.3), width = 0.15,
+                linetype = "solid") +
+  scale_linetype_manual(values = c(`TRUE` = "dashed", `FALSE` = "solid"), guide = "none") +
+  #scale_colour_manual(values = c("ZSS" = "red", "ΔSHAP" = "blue",
+  #                                "ΔSHAP (shuffled)" = "grey60")) +
+  scale_colour_manual(values = c("ZSS" = real_colors[1],
+                                "ΔSHAP" = real_colors[2],
+                                "ΔSHAP (shuffled)" = "grey60")) +
+  theme_classic(base_size = 13) +
+  labs(x = NULL, y = "Mean MAF", color = NULL)
+
+print(fig)
+print(plot_df)
+
+# Save figure
+ggsave(fig, filename = paste0("./submission_figures_data/Fig9_v1_", Sys.Date(), ".pdf"),
+       device = cairo_pdf, units = "mm", width = 170, height = 130, dpi = 600)
+
+# Export plot_df as supplement
+library(openxlsx)
+ex_sheetlist_figX <- list("Fig9_MAF_Binned_Means" = plot_df)
+write.xlsx(ex_sheetlist_figX, file = paste0("./submission_figures_data/Supp_Table_XX_fig9_", Sys.Date(), ".xlsx"))
+```
